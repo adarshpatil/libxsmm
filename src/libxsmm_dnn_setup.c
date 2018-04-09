@@ -179,9 +179,9 @@ LIBXSMM_API_INTERN libxsmm_dnn_err_t libxsmm_dnn_setup_feature_map_blocks( libxs
     handle->blocksofm_lp = handle->blocksofm;
   }
 
-    handle->block_fwd_ofm = 16;
-    handle->block_bwd_ifm = 16;
-  
+  handle->block_fwd_ofm = 16;
+  handle->block_bwd_ifm = 16;
+
   /* Let's check one more time that we can actually block */
   if ( (handle->desc.C % (handle->ifmblock * handle->fm_lp_block) != 0) || (handle->desc.K % (handle->ofmblock) != 0)) {
     handle->custom_format_type = LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM_1;
@@ -359,8 +359,8 @@ LIBXSMM_API_INTERN libxsmm_dnn_err_t libxsmm_dnn_setup_fwd( libxsmm_dnn_layer* h
     }
   }
   handle->n_variants = n_variants; 
-   
-    /* if we have 1x1 let's bring some ifms into the kernel for forward to increase accumulation chain length on AVX512 */
+
+  /* if we have 1x1 let's bring some ifms into the kernel for forward to increase accumulation chain length on AVX512 */
   if ( (handle->buffer_format == LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM) && (handle->custom_format_type == LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM_1) ) {
     if ( ((handle->ifmblock*handle->fm_lp_block)%16 == 0) &&  (handle->desc.C%(handle->ifmblock*handle->fm_lp_block*512) == 0) && (handle->desc.R == 1) &&  (handle->desc.S == 1) ) {
       handle->blocksifm_blocking = 512;
@@ -1321,6 +1321,9 @@ LIBXSMM_API_INTERN libxsmm_dnn_err_t libxsmm_dnn_setup_upd( libxsmm_dnn_layer* h
           }
 
           if (handle->ofh == 28 || handle->ofh == 35 || handle->ofh == 56 ||  handle->ofh == 71  || handle->ofh == 149 ||  handle->ofh == 147 || handle->ofh == 73  || ( handle->ofh == 14 && handle->desc.threads > 1 && ( handle->desc.C == 512 && (handle->desc.K == 1024 || handle->desc.K == 256) ) )) {
+            if ((descriptor.use_nts == 1) && (handle->desc.threads != handle->desc.N)) {
+              descriptor.use_nts = 0;
+            }
             handle->use_hybrid_wu_parallelism = 0;
             handle->weight_copies = handle->desc.threads;
             descriptor.ncopies = handle->weight_copies;
@@ -1369,6 +1372,8 @@ LIBXSMM_API_INTERN libxsmm_dnn_err_t libxsmm_dnn_setup_upd( libxsmm_dnn_layer* h
             handle->reduce_weights = 1;
           }
         }
+
+        handle->use_nts_upd = descriptor.use_nts;
 
         /* NONE */
         if (handle->padding_flag == 1) {

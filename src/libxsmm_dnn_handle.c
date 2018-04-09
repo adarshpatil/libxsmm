@@ -113,169 +113,52 @@ LIBXSMM_API_INTERN libxsmm_dnn_err_t libxsmm_dnn_internal_create_conv_handle_dir
     handle->use_thread_private_jit = 0;
   }
 
-  /* now architecture specific */
+  /* If we have AVX512 and kernel streams is enabled, then we generate specialized code */
   if ( (libxsmm_target_archid == LIBXSMM_X86_AVX512_MIC  ||
         libxsmm_target_archid == LIBXSMM_X86_AVX512_CORE ||
         libxsmm_target_archid == LIBXSMM_X86_AVX512_KNM  ||
         libxsmm_target_archid == LIBXSMM_X86_AVX512_ICL    ) &&
       handle->use_thread_private_jit == 1 )
   {
+    /* This is basically a decision pertaining for all three passes: FWD, BWD and UPD */ 
+    /* Initialize fields that control layer fusion */
+    noarch = 0;
+    handle->compute_batch_stats_in_kernel = 0;
+    handle->compute_max_in_kernel_fwd = 0;
+    handle->compute_max_in_kernel_bwd = 0;
+    handle->perform_relu_in_kernel = 0;
+
     /* Calculate feature map blocking factors based on precision and datatypes */
-    /* This is basically a decision pertaining for all three passes: FWD, BWD and UPD */
     status = libxsmm_dnn_setup_feature_map_blocks(handle, &noarch);
     if ( status ==  LIBXSMM_DNN_ERR_UNSUPPORTED_DATATYPE) {
       free(handle);
       handle = 0;
       return status;
-    } 
-  }
+    }
 
-  if (noarch == 0) {
     /* Forward path setup */
+    status = libxsmm_dnn_setup_fwd(handle, &noarch); 
+
     /* Backward path setup */
+    status = libxsmm_dnn_setup_bwd(handle, &noarch); 
+
     /* Weight update path setup */
-    {
-      handle->barrier = libxsmm_barrier_create(handle->desc.threads, 1);
-      /* backward transpose filters */
-      handle->scratch1 = 0;
-      handle->scratch1_size = handle->blocksifm_lp * handle->ifmblock * handle->blocksofm * handle->ofmblock
-        * handle->desc.R * handle->desc.S * handle->fm_lp_block * libxsmm_dnn_typesize(handle->datatype_in);
-      if (handle->fm_lp_block > 1) {
-        /* If low precision, we need extra buffer to store intermediate weight tensor */
-        handle->scratch1_size *= 2;
-      }
+    status = libxsmm_dnn_setup_upd(handle, &noarch); 
 
-      /* weight update transpose of minibatch */
-      handle->scratch3 = 0;
-      handle->scratch3_size = handle->desc.N * handle->blocksifm_lp * handle->ifmblock * handle->ifhp * (handle->ifwp+8)
-        * handle->fm_lp_block * libxsmm_dnn_typesize(handle->datatype_in);
-
-      /* minibatch parallel execution of weight update kernel */
-      if ( ((handle->blocksifm * handle->blocksofm) < handle->desc.threads) || (handle->use_thread_private_jit) ) {
-        handle->upd_use_thread_fil = 1;
-        handle->scratch4 = 0;
-        handle->scratch4_size = 2 * handle->desc.threads * handle->desc.C * handle->desc.K * handle->desc.R * handle->desc.S * libxsmm_dnn_typesize(handle->datatype_out);
-#if 0
-        handle->scratch4_size += 32*handle->desc.threads *  handle->blocksofm *  handle->blocksifm * handle->desc.R
-          * handle->desc.S * handle->ifmblock * handle->ofmblock * libxsmm_dnn_typesize(handle->datatype_out);
-#endif
-        /* enable external reduce of filter scratch */
-        if ( (handle->options & LIBXSMM_DNN_CONV_OPTION_UPD_NO_FILTER_REDUCE) > 0 ) {
-          handle->upd_use_external_reduce = 1;
-        }
-      } else {
-        handle->scratch4 = 0;
-        handle->scratch4_size = 0;
-        handle->upd_use_thread_fil = 0;
-      }
-
-      /* Allocate scratch for additional output transpose */
-      if (handle->use_lp_kernel == 1) {
-        handle->scratch6 = 0;
-        handle->scratch6_size = handle->desc.N * handle->blocksofm * handle->ofmblock * (handle->ofhp+2*handle->desc.pad_h) * (handle->ofwp+8+2*handle->desc.pad_w) * libxsmm_dnn_typesize(handle->datatype_in);
-      } else {
-        handle->scratch6 = 0;
-        handle->scratch6_size = 0;
-      }
-    }
-  } else {
-    /* @TODO let's make these env variable to study */
-    int tmp_max_c_block = 16;
-    int tmp_max_k_block = 16;
-    int tmp_block = 0;
-
-    if ( handle->desc.C < tmp_max_c_block ) {
-      handle->ifmblock = handle->desc.C;
-    } else {
-      for ( tmp_block = 1; tmp_block <= tmp_max_c_block; tmp_block *= 2 ) {
-        if ( handle->desc.C % tmp_block == 0 ) handle->ifmblock = tmp_block;
-      }
-    }
-    handle->blocksifm = handle->desc.C / handle->ifmblock;
-
-    if ( handle->desc.K < tmp_max_k_block ) {
-      handle->ofmblock = handle->desc.K;
-    } else {
-      for ( tmp_block = 1; tmp_block <= tmp_max_k_block; tmp_block *= 2 ) {
-        if ( handle->desc.K % tmp_block == 0 ) handle->ofmblock = tmp_block;
-      }
-    }
-    handle->blocksofm = handle->desc.K / handle->ofmblock;
-
-    handle->fwd_ofh_rb = 1;
-    handle->fwd_ofw_rb = handle->ofw;
-    handle->bwd_ofh_rb = 1;
-    handle->bwd_ofw_rb = handle->ofw;
-    handle->fm_lp_block = 1;
-    handle->use_thread_private_jit = 0;
-
-    /* Adjust blocking factors if custom_2 format is requested */
-    if ((handle->buffer_format == LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM) && (handle->custom_format_type == LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM_2)) {
-      if (handle->datatype_in == LIBXSMM_DNN_DATATYPE_F32)  {
-        /* In this case of custom_2 format, regardless of requested padding, all the pad_in/pad_out parameters should be 0 */
-        if ( ((handle->desc.pad_h > 0) && ((handle->desc.pad_h_in != 0) || (handle->desc.pad_h_out != 0))) || ((handle->desc.pad_w > 0) && ((handle->desc.pad_w_in != 0) || (handle->desc.pad_w_out !=0))) ) {
-          status = LIBXSMM_DNN_ERR_INVALID_PADDING;
-          free(handle);
-          handle = 0;
-          return status;
-        }
-        if ( (handle->desc.N % 16 == 0) && (handle->desc.C % 16 == 0) && (handle->desc.K % 16 == 0) ) {
-          handle->nbImg = 16;
-          handle->ifmblock = 16;
-          handle->ofmblock = 16;
-          handle->fm_lp_block = 1;
-        } else {
-          /* Fallback to custom_1 format, when using custom_2 format N should be divisible by 16 */
-          handle->custom_format_type = LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM_1;
-        }
-      } else {
-        /* Fallback to custom_1 format, for now custom_2 format is supported only for float */
-        handle->custom_format_type = LIBXSMM_DNN_TENSOR_FORMAT_LIBXSMM_1;
-      }
-    }
-
-    /* use generic code path */
-    handle->use_fwd_generic = 1;
-    handle->use_bwd_generic = 1;
-    handle->use_upd_generic = 1;
-
-    handle->code_fwd[0].xconv.sconv = 0;
-    handle->code_fwd[1].xconv.sconv = 0;
-    handle->code_fwd[2].xconv.sconv = 0;
-    /* Backward path */
-    handle->code_bwd[0].xconv.sconv = 0;
-    handle->code_bwd[1].xconv.sconv = 0;
-    handle->code_bwd[2].xconv.sconv = 0;
-    /* weight update path */
-    handle->code_upd[0].xconv.sconv = 0;
-    handle->code_upd[1].xconv.sconv = 0;
-
-    /* prepare barrier */
-    handle->barrier = libxsmm_barrier_create(handle->desc.threads, 1);
-
-    /* backward transpose filters, as we want to call small GEMMs we need that scratch */
-    handle->scratch1 = 0;
-    handle->scratch1_size = handle->blocksifm * handle->ifmblock * handle->blocksofm * handle->ofmblock
-      * handle->desc.R * handle->desc.S * libxsmm_dnn_typesize(handle->datatype_in);
-    if (handle->fm_lp_block > 1) {
-      /* If low precision, we need extra buffer to store intermediate weight tensor */
-      handle->scratch1_size *= 2;
-    }
-
-    handle->scratch3 = 0;
-    handle->scratch3_size = 0;
-    handle->scratch4 = 0;
-    handle->scratch4_size = 0;
+    /* Calculate scratch requirements */
+    libxsmm_dnn_setup_scratch(handle);
   }
 
+  /* Generic codepath setup here... */
   if (handle->use_fwd_generic != 0 || handle->use_bwd_generic != 0 || handle->use_upd_generic != 0) {
+    /*Setup generic code generation here*/
+    status = libxsmm_dnn_setup_generic(handle);
     const int padded_h = handle->desc.H + (2 * handle->desc.pad_h);
     const int padded_w = handle->desc.W + (2 * handle->desc.pad_w);
     const size_t size7 = padded_h * padded_w * handle->ifmblock * libxsmm_dnn_typesize(handle->datatype_in);
     handle->scratch7_size = LIBXSMM_UP2(size7, LIBXSMM_CACHELINE) * handle->desc.threads;
     handle->scratch7 = 0;
-  }
-  else {
+  } else {
     handle->scratch7_size = 0;
     handle->scratch7 = 0;
   }
